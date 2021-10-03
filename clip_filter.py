@@ -4,10 +4,13 @@ from PIL import Image
 import torch.nn as nn
 from multiprocessing import cpu_count
 
-debug = True
-device = "cuda" if torch.cuda.is_available() else "cpu"
-use_jit = torch.cuda.is_available() and '1.7.1' in torch.__version__
-multiple_gpus = torch.cuda.device_count() > 1
+use_cuda = torch.cuda.is_available()
+device = "cuda:0" if use_cuda else "cpu"
+
+num_gpus = torch.cuda.device_count()
+multiple_gpus = num_gpus > 1
+
+use_jit = use_cuda and (not multiple_gpus) and '1.7.1' in torch.__version__
 
 class CLIPDataset(torch.utils.data.Dataset):
     def __init__(self, dataframe, preprocess):
@@ -25,12 +28,20 @@ class CLIPDataset(torch.utils.data.Dataset):
             self.tokenizer(str(row["TEXT"]), truncate=True)[0],
         )
 
+class CLIPDataParallel(nn.DataParallel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.encode_text = self.module.encode_text
+        self.encode_image = self.module.encode_image
+
+
 class CLIP:
     def __init__(self):
-        self.model, self.preprocess = clip.load("ViT-B/32", device='cpu' if multiple_gpus else device, jit=use_jit)
-        self.device = torch.device(device)
+        self.model, self.preprocess = clip.load("ViT-B/32", device="cpu", jit=use_jit)
+
         if multiple_gpus:
-            self.model = nn.DataParallel(self.model).to(device)
+            self.model = CLIPDataParallel(self.model)
+        self.model.to(device)
 
         self.cosine_similarity = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
         with torch.no_grad():
@@ -40,8 +51,8 @@ class CLIP:
 
     def similarity_imgalt(self, image_tensor, text_tokens):
         with torch.no_grad():
-            image_features = self.model.encode_image(image_tensor.to(device)).float()
-            text_features = self.model.encode_text(text_tokens.to(device)).float()
+            image_features = self.model.encode_image(image_tensor).float()
+            text_features = self.model.encode_text(text_tokens).float()
             similarity = self.cosine_similarity(image_features, text_features).tolist()
 
         image_features = image_features.detach().cpu().numpy()
@@ -50,18 +61,27 @@ class CLIP:
     def preprocess_images(self, df):
         ret_image_features = []
         ret_similarity = []
-        batch_size = 256 if device == "cuda" else 8
+        probs = []
+        batch_size = 256*num_gpus if use_cuda else 8
         dataset = CLIPDataset(df, self.preprocess)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=int(cpu_count()-3), pin_memory=True)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
         for tensors, tokens in dataloader:
+            tensors, tokens = tensors.to(device), tokens.to(device)
             image_features, similarities = self.similarity_imgalt(tensors, tokens)
+
+            for image_feature in image_features:
+                nsfw_prob = clip_filter.prob(image_feature, clip_filter.categories)
+                underage_prob = clip_filter.prob(image_feature, clip_filter.underaged_categories)
+                animal_prob = clip_filter.prob(image_feature, clip_filter.animal_categories)
+                probs.append((nsfw_prob, underage_prob, animal_prob))
+
             ret_image_features.extend(image_features)
             ret_similarity.extend(similarities)
-        return ret_image_features, ret_similarity
+        return ret_image_features, ret_similarity, probs
 
     def prob(self, image_features, text_features):
         text_features = text_features.float()
-        image_features = torch.as_tensor(image_features).to(device, dtype=torch.float32)
+        image_features = torch.as_tensor(image_features).to(torch.float32)
         image_features /= image_features.norm(dim=-1, keepdim=True)
         text_features /= text_features.norm(dim=-1, keepdim=True)
 
@@ -78,7 +98,7 @@ def df_clipfilter(df):
     sim_threshold = 0.3
     underaged_text = ["teen", "kid", "child", "baby"]
 
-    img_embedding, similarities = clip_filter.preprocess_images(df)
+    img_embedding, similarities, probs = clip_filter.preprocess_images(df)
     tmp_embed = []
 
     df["dropped"] = False
@@ -89,8 +109,9 @@ def df_clipfilter(df):
             df.at[i, 'dropped'] = True
             continue
 
+        nsfw_prob, underage_prob, animal_prob = probs[i]
+
         # get most similar categories
-        nsfw_prob = clip_filter.prob(img_embed, clip_filter.categories)
         df.at[i, "NSFW"] = "UNSURE"
         df.at[i, "similarity"] = similarities[i]
         if nsfw_prob[0] < 19 and nsfw_prob[1] < 19:
@@ -100,13 +121,11 @@ def df_clipfilter(df):
         elif nsfw_prob[0] >= 19 and nsfw_prob[1] >= 19:
             df.at[i, "NSFW"] = "NSFW"
 
-        underage_prob = clip_filter.prob(img_embed, clip_filter.underaged_categories)
         if underage_prob[0] < 4 or underage_prob[1] < 4 or any(x in df.at[i, "TEXT"] for x in underaged_text):
             #df.drop(i, inplace=True)
             df.at[i, 'dropped'] = True
             continue
 
-        animal_prob = clip_filter.prob(img_embed, clip_filter.animal_categories)
         if animal_prob[0] > 20:
             #df.drop(i, inplace=True)
             df.at[i, 'dropped'] = True
