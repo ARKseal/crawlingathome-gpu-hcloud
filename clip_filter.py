@@ -5,7 +5,7 @@ import torch.nn as nn
 from multiprocessing import cpu_count
 
 use_cuda = torch.cuda.is_available()
-device = "cuda:0" if use_cuda else "cpu"
+device = torch.device("cuda:0" if use_cuda else "cpu")
 
 num_gpus = torch.cuda.device_count()
 multiple_gpus = num_gpus > 1
@@ -28,60 +28,30 @@ class CLIPDataset(torch.utils.data.Dataset):
             self.tokenizer(str(row["TEXT"]), truncate=True)[0],
         )
 
-class CLIPDataParallel(nn.DataParallel):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.encode_text = self.module.encode_text
-        self.encode_image = self.module.encode_image
-
-
-class CLIP:
-    def __init__(self):
-        self.model, self.preprocess = clip.load("ViT-B/32", device="cpu", jit=use_jit)
-
-        if multiple_gpus:
-            self.model = CLIPDataParallel(self.model)
-        self.model.to(device)
-
+class CLIPModel(nn.Module):
+    def __init__(self, clip_model, sim_threshold):
+        super().__init__()
+        self.clip_model = clip_model
+        self.sim_threshold = sim_threshold
         self.cosine_similarity = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
-        with torch.no_grad():
-            self.categories = self.model.encode_text(clip.tokenize(["neutral","selfie", "illustration, drawing", "toys, play, kids, children", "teddy bear, puppet", "animal, bird, mammal, insect" "fashion, clothes", "logo, commercial, ad, advertisement", "drawing, painting","anime, cartoon","comedy, fun","romance, love story","thriller, suspense, crime story","action, action movie", "horror, monster movie", "documentary", "news, journalism", "entertainment", "talk show", "porn, sex, sperm, nipples, breats, tits, boops, penis, dick, cock, clitoris, vagina, fuck, lust, horny, sexual, lick, licking",  "porn, sex, sperm, nipples", "porn, sex, sperm, penis, dick, cock", "nipples, breats, tits, boops, sexy", "penis, dick, cock", "clitoris, vagina", "sex, fuck, lust, horny, sexual, lick, licking", "porn, sex, sexy","sexy, hot","sperm, skin","lust, horny, sexual","lick, licking, body", "anime, hentai, sexy", "cartoon, sexy, sex", "hentai", "anime, sexy, breasts", "hentai"]).to(device))
-            self.underaged_categories = self.model.encode_text(clip.tokenize(["teenager, teen", "kid, child, teenager, teen, baby or toddler, underaged, little girl, little boy", "kid, child, little girl, little boy", "baby, toddler","adult, woman, man, grownup, grown person,full-aged of legal age","full-aged, of legal age, adult","woman, man","adult, woman, man, grownup, grown person,full-aged of legal age"]).to(device))
-            self.animal_categories = self.model.encode_text(clip.tokenize(["lifeless object, thing", "thing, object", "material", "furniture","wall", "house", "tree", "wood","ground","industry", "table", "bed", "tool", "dress, clothes", "door", "chair", "rock, stone", "human", "man", "woman", "man, woman", "animal","cat","dog", "cow", "pig", "goat", "sheep", "elephant", "horse", "horse, elephant, pig, dog, cat, sheep, goat, animal", "life", "wildlife"]).to(device))
 
+        with torch.no_grad():
+            self.categories = self.clip_model.encode_text(clip.tokenize(["neutral","selfie", "illustration, drawing", "toys, play, kids, children", "teddy bear, puppet", "animal, bird, mammal, insect" "fashion, clothes", "logo, commercial, ad, advertisement", "drawing, painting","anime, cartoon","comedy, fun","romance, love story","thriller, suspense, crime story","action, action movie", "horror, monster movie", "documentary", "news, journalism", "entertainment", "talk show", "porn, sex, sperm, nipples, breats, tits, boops, penis, dick, cock, clitoris, vagina, fuck, lust, horny, sexual, lick, licking",  "porn, sex, sperm, nipples", "porn, sex, sperm, penis, dick, cock", "nipples, breats, tits, boops, sexy", "penis, dick, cock", "clitoris, vagina", "sex, fuck, lust, horny, sexual, lick, licking", "porn, sex, sexy","sexy, hot","sperm, skin","lust, horny, sexual","lick, licking, body", "anime, hentai, sexy", "cartoon, sexy, sex", "hentai", "anime, sexy, breasts", "hentai"]))
+            self.underaged_categories = self.clip_model.encode_text(clip.tokenize(["teenager, teen", "kid, child, teenager, teen, baby or toddler, underaged, little girl, little boy", "kid, child, little girl, little boy", "baby, toddler","adult, woman, man, grownup, grown person,full-aged of legal age","full-aged, of legal age, adult","woman, man","adult, woman, man, grownup, grown person,full-aged of legal age"]))
+            self.animal_categories = self.clip_model.encode_text(clip.tokenize(["lifeless object, thing", "thing, object", "material", "furniture","wall", "house", "tree", "wood","ground","industry", "table", "bed", "tool", "dress, clothes", "door", "chair", "rock, stone", "human", "man", "woman", "man, woman", "animal","cat","dog", "cow", "pig", "goat", "sheep", "elephant", "horse", "horse, elephant, pig, dog, cat, sheep, goat, animal", "life", "wildlife"]))
+        self.all_categories = (self.categories, self.underaged_categories, self.animal_categories)
+    
     def similarity_imgalt(self, image_tensor, text_tokens):
         with torch.no_grad():
-            image_features = self.model.encode_image(image_tensor).float()
-            text_features = self.model.encode_text(text_tokens).float()
+            image_features = self.clip_model.encode_image(image_tensor).float()
+            text_features = self.clip_model.encode_text(text_tokens).float()
             similarity = self.cosine_similarity(image_features, text_features).tolist()
 
-        image_features = image_features.detach().cpu().numpy()
         return image_features, similarity
 
-    def preprocess_images(self, df):
-        ret_image_features = []
-        ret_similarity = []
-        probs = []
-        batch_size = 256*num_gpus if use_cuda else 8
-        dataset = CLIPDataset(df, self.preprocess)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
-        for tensors, tokens in dataloader:
-            tensors, tokens = tensors.to(device), tokens.to(device)
-            image_features, similarities = self.similarity_imgalt(tensors, tokens)
-
-            for image_feature in image_features:
-                nsfw_prob = clip_filter.prob(image_feature, clip_filter.categories)
-                underage_prob = clip_filter.prob(image_feature, clip_filter.underaged_categories)
-                animal_prob = clip_filter.prob(image_feature, clip_filter.animal_categories)
-                probs.append((nsfw_prob, underage_prob, animal_prob))
-
-            ret_image_features.extend(image_features)
-            ret_similarity.extend(similarities)
-        return ret_image_features, ret_similarity, probs
-
-    def prob(self, image_features, text_features):
+    @staticmethod
+    def prob(image_features, text_features):
         text_features = text_features.float()
-        image_features = torch.as_tensor(image_features).to(torch.float32)
         image_features /= image_features.norm(dim=-1, keepdim=True)
         text_features /= text_features.norm(dim=-1, keepdim=True)
 
@@ -89,13 +59,50 @@ class CLIP:
         similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
         _, indices = similarity.topk(2)
         return indices
+    
+    def probs(self, image_features, cats):
+        return (CLIPModel.prob(image_features, category) for category in cats)
 
+    def forward(self, tensors: torch.Tensor, tokens: torch.Tensor):
+        dev = tensors.device
+        cats = (cat.to(dev) for cat in self.all_categories)
+        image_features, similarities = self.similarity_imgalt(tensors, tokens)
 
-clip_filter = CLIP()
+        probs = [self.probs(image_feature, cats) if similarity < self.sim_threshold else None \
+            for image_feature, similarity in zip(image_features, similarities)]
 
+        return image_features, similarities, probs
+
+class CLIP:
+    def __init__(self, sim_threshold):
+        self.clip_model, self.preprocess = clip.load("ViT-B/32", device="cpu", jit=use_jit)
+        self.model = CLIPModel(self.clip_model, sim_threshold)
+
+        if multiple_gpus:
+            self.model = nn.DataParallel(self.model)
+        self.model.to(device)
+
+    def preprocess_images(self, df):
+        ret_image_features = []
+        ret_similarity = []
+        ret_probs = []
+        batch_size = 256*num_gpus if use_cuda else 8
+        dataset = CLIPDataset(df, self.preprocess)
+        dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False)
+        for tensors, tokens in dataloader:
+            tensors, tokens = tensors.to(device), tokens.to(device)
+
+            image_features, similarities, probs = self.model(tensors, tokens)
+
+            ret_image_features.extend(image_features)
+            ret_similarity.extend(similarities)
+            ret_probs.extend(probs)
+        return ret_image_features, ret_similarity, ret_probs
+
+sim_threshold = 0.3
+clip_filter = CLIP(sim_threshold)
 
 def df_clipfilter(df):
-    sim_threshold = 0.3
     underaged_text = ["teen", "kid", "child", "baby"]
 
     img_embedding, similarities, probs = clip_filter.preprocess_images(df)
@@ -104,8 +111,7 @@ def df_clipfilter(df):
     df["dropped"] = False
 
     for i, img_embed in enumerate(img_embedding):
-        if similarities[i] < sim_threshold:
-            #df.drop(i, inplace=True)
+        if probs[i] is None: # if the similaroty didn't meet the threshold
             df.at[i, 'dropped'] = True
             continue
 
@@ -122,12 +128,10 @@ def df_clipfilter(df):
             df.at[i, "NSFW"] = "NSFW"
 
         if underage_prob[0] < 4 or underage_prob[1] < 4 or any(x in df.at[i, "TEXT"] for x in underaged_text):
-            #df.drop(i, inplace=True)
             df.at[i, 'dropped'] = True
             continue
 
         if animal_prob[0] > 20:
-            #df.drop(i, inplace=True)
             df.at[i, 'dropped'] = True
             continue
         tmp_embed.append(img_embed)
