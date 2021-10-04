@@ -1,7 +1,9 @@
 import clip
 import torch
-from PIL import Image
+import pandas as pd
 import torch.nn as nn
+from PIL import Image
+from typing import Generator, Tuple
 from multiprocessing import cpu_count
 
 use_cuda = torch.cuda.is_available()
@@ -10,18 +12,16 @@ device = torch.device("cuda:0" if use_cuda else "cpu")
 num_gpus = torch.cuda.device_count()
 multiple_gpus = num_gpus > 1
 
-use_jit = use_cuda and (not multiple_gpus) and '1.7.1' in torch.__version__
-
 class CLIPDataset(torch.utils.data.Dataset):
-    def __init__(self, dataframe, preprocess):
+    def __init__(self, dataframe: pd.DataFrame, preprocess):
         self.dataframe = dataframe
         self.image_transform = preprocess
         self.tokenizer = clip.tokenize
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.dataframe)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         row = self.dataframe.iloc[index]
         return (
             self.image_transform(Image.open(row["PATH"])),
@@ -29,8 +29,8 @@ class CLIPDataset(torch.utils.data.Dataset):
         )
 
 class CLIPModel(nn.Module):
-    def __init__(self, clip_model, sim_threshold):
-        super().__init__()
+    def __init__(self, clip_model: nn.Module, sim_threshold: int):
+        super(CLIPModel, self).__init__()
         self.clip_model = clip_model
         self.sim_threshold = sim_threshold
         self.cosine_similarity = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
@@ -41,16 +41,16 @@ class CLIPModel(nn.Module):
             self.animal_categories = self.clip_model.encode_text(clip.tokenize(["lifeless object, thing", "thing, object", "material", "furniture","wall", "house", "tree", "wood","ground","industry", "table", "bed", "tool", "dress, clothes", "door", "chair", "rock, stone", "human", "man", "woman", "man, woman", "animal","cat","dog", "cow", "pig", "goat", "sheep", "elephant", "horse", "horse, elephant, pig, dog, cat, sheep, goat, animal", "life", "wildlife"]))
         self.all_categories = (self.categories, self.underaged_categories, self.animal_categories)
     
-    def similarity_imgalt(self, image_tensor, text_tokens):
+    def similarity_imgalt(self, image_tensor: torch.Tensor, text_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.no_grad():
             image_features = self.clip_model.encode_image(image_tensor).float()
             text_features = self.clip_model.encode_text(text_tokens).float()
-            similarity = self.cosine_similarity(image_features, text_features).tolist()
+            similarity = self.cosine_similarity(image_features, text_features)
 
         return image_features, similarity
 
     @staticmethod
-    def prob(image_features, text_features):
+    def prob(image_features: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
         text_features = text_features.float()
         image_features /= image_features.norm(dim=-1, keepdim=True)
         text_features /= text_features.norm(dim=-1, keepdim=True)
@@ -60,49 +60,50 @@ class CLIPModel(nn.Module):
         _, indices = similarity.topk(2)
         return indices
     
-    def probs(self, image_features, cats):
-        return (CLIPModel.prob(image_features, category) for category in cats)
+    def probs(self, image_features: torch.Tensor, cats: Generator) -> torch.Tensor:
+        return torch.stack([CLIPModel.prob(image_features, category) for category in cats])
 
-    def forward(self, tensors: torch.Tensor, tokens: torch.Tensor):
+    def forward(self, tensors: torch.Tensor, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dev = tensors.device
-        cats = (cat.to(dev) for cat in self.all_categories)
+        cats = tuple(cat.to(dev) for cat in self.all_categories)
         image_features, similarities = self.similarity_imgalt(tensors, tokens)
 
-        probs = [self.probs(image_feature, cats) if similarity < self.sim_threshold else None \
+        probs = [self.probs(image_feature, cats) if similarity < self.sim_threshold else torch.zeros(3, 2).to(dev) \
             for image_feature, similarity in zip(image_features, similarities)]
 
-        return image_features, similarities, probs
+        return image_features, similarities, torch.stack(probs)
 
 class CLIP:
-    def __init__(self, sim_threshold):
-        self.clip_model, self.preprocess = clip.load("ViT-B/32", device="cpu", jit=use_jit)
+    def __init__(self, sim_threshold: int):
+        self.clip_model, self.preprocess = clip.load("ViT-B/32", device="cpu", jit=False)
         self.model = CLIPModel(self.clip_model, sim_threshold)
 
         if multiple_gpus:
             self.model = nn.DataParallel(self.model)
         self.model.to(device)
 
-    def preprocess_images(self, df):
+    def preprocess_images(self, df: pd.DataFrame) -> Tuple[list, list, list]:
         ret_image_features = []
         ret_similarity = []
         ret_probs = []
         batch_size = 256*num_gpus if use_cuda else 8
+
         dataset = CLIPDataset(df, self.preprocess)
-        dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False)
+        dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=batch_size, num_workers=cpu_count()-3, shuffle=False, pin_memory=True)
+
         for tensors, tokens in dataloader:
             tensors, tokens = tensors.to(device), tokens.to(device)
-
             image_features, similarities, probs = self.model(tensors, tokens)
 
             ret_image_features.extend(image_features)
             ret_similarity.extend(similarities)
-            ret_probs.extend(probs)
-        return ret_image_features, ret_similarity, ret_probs
+            ret_probs.extend(probs.tolist())
+        return ret_image_features, [tensor.tolist() for tensor in ret_similarity], ret_probs
 
 sim_threshold = 0.3
 clip_filter = CLIP(sim_threshold)
 
-def df_clipfilter(df):
+def df_clipfilter(df: pd.DataFrame):
     underaged_text = ["teen", "kid", "child", "baby"]
 
     img_embedding, similarities, probs = clip_filter.preprocess_images(df)
@@ -111,7 +112,7 @@ def df_clipfilter(df):
     df["dropped"] = False
 
     for i, img_embed in enumerate(img_embedding):
-        if probs[i] is None: # if the similaroty didn't meet the threshold
+        if all(prob==0 for prob in probs[i]): # if the similaroty didn't meet the threshold
             df.at[i, 'dropped'] = True
             continue
 
@@ -141,7 +142,7 @@ def df_clipfilter(df):
     return tmp_embed, df
 
 
-def df_tfrecords(df, output_fname):
+def df_tfrecords(df: pd.DataFrame, output_fname: str) -> None:
     import tensorflow as tf
     from tfr_image.utils import bytes_feature, int64_feature
 
@@ -177,7 +178,7 @@ def df_tfrecords(df, output_fname):
             tfrecord_writer.write(example.SerializeToString())
 
 
-def filter(df, out_fname, output_folder):
+def filter(df: pd.DataFrame, out_fname: str, output_folder: str) -> Tuple[int, pd.Series]:
     # save hashes
     # df.loc[:,"hash"] = df.apply(lambda row: hashlib.md5((str(row.URL)+str(row.TEXT)).encode("utf-8")).hexdigest(), axis=1) # seems already set from gpu.py
     with open(f"{output_folder}hashes-{out_fname}.clp", "wt") as f:
