@@ -1,5 +1,6 @@
 import clip
 import torch
+import numpy as np
 import pandas as pd
 import torch.nn as nn
 from PIL import Image
@@ -63,7 +64,7 @@ class CLIPModel(nn.Module):
     def probs(self, image_features: torch.Tensor, cats: Generator) -> torch.Tensor:
         return torch.stack([CLIPModel.prob(image_features, category) for category in cats])
 
-    def forward(self, tensors: torch.Tensor, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, tensors: torch.Tensor, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         dev = tensors.device
         cats = tuple(cat.to(dev) for cat in self.all_categories)
         image_features, similarities = self.similarity_imgalt(tensors, tokens)
@@ -71,7 +72,7 @@ class CLIPModel(nn.Module):
         probs = [self.probs(image_feature, cats) if similarity < self.sim_threshold else torch.zeros(3, 2).to(dev) \
             for image_feature, similarity in zip(image_features, similarities)]
 
-        return image_features, similarities, torch.stack(probs)
+        return similarities, torch.stack(probs)
 
 class CLIP:
     def __init__(self, sim_threshold: int):
@@ -82,23 +83,21 @@ class CLIP:
             self.model = nn.DataParallel(self.model)
         self.model.to(device)
 
-    def preprocess_images(self, df: pd.DataFrame) -> Tuple[list, list, list]:
-        ret_image_features = []
+    def preprocess_images(self, df: pd.DataFrame) -> Tuple[list, list]:
         ret_similarity = []
         ret_probs = []
-        batch_size = 256*num_gpus if use_cuda else 8
+        batch_size = 64 if use_cuda else 8
 
         dataset = CLIPDataset(df, self.preprocess)
         dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=batch_size, num_workers=cpu_count()-3, shuffle=False, pin_memory=True)
 
         for tensors, tokens in dataloader:
-            tensors, tokens = tensors.to(device), tokens.to(device)
-            image_features, similarities, probs = self.model(tensors, tokens)
+            tensors, tokens = tensors.to(device, non_blocking=True), tokens.to(device, non_blocking=True)
+            similarities, probs = self.model(tensors, tokens)
 
-            ret_image_features.extend(image_features)
-            ret_similarity.extend(similarities)
+            ret_similarity.extend(similarities.tolist())
             ret_probs.extend(probs.tolist())
-        return ret_image_features, [tensor.tolist() for tensor in ret_similarity], ret_probs
+        return ret_similarity, ret_probs
 
 sim_threshold = 0.3
 clip_filter = CLIP(sim_threshold)
@@ -106,12 +105,11 @@ clip_filter = CLIP(sim_threshold)
 def df_clipfilter(df: pd.DataFrame):
     underaged_text = ["teen", "kid", "child", "baby"]
 
-    img_embedding, similarities, probs = clip_filter.preprocess_images(df)
-    tmp_embed = []
+    similarities, probs = clip_filter.preprocess_images(df)
 
     df["dropped"] = False
 
-    for i, img_embed in enumerate(img_embedding):
+    for i, similarity in enumerate(similarities):
         if all(prob==0 for prob in probs[i]): # if the similaroty didn't meet the threshold
             df.at[i, 'dropped'] = True
             continue
@@ -120,10 +118,9 @@ def df_clipfilter(df: pd.DataFrame):
 
         # get most similar categories
         df.at[i, "NSFW"] = "UNSURE"
-        df.at[i, "similarity"] = similarities[i]
+        df.at[i, "similarity"] = similarity
         if nsfw_prob[0] < 19 and nsfw_prob[1] < 19:
             df.at[i, "NSFW"] = "UNLIKELY"
-            tmp_embed.append(img_embed)
             continue
         elif nsfw_prob[0] >= 19 and nsfw_prob[1] >= 19:
             df.at[i, "NSFW"] = "NSFW"
@@ -135,11 +132,10 @@ def df_clipfilter(df: pd.DataFrame):
         if animal_prob[0] > 20:
             df.at[i, 'dropped'] = True
             continue
-        tmp_embed.append(img_embed)
         
     df = df[df["dropped"] != True]
     df.reset_index(drop=True, inplace=True)
-    return tmp_embed, df
+    return df
 
 
 def df_tfrecords(df: pd.DataFrame, output_fname: str) -> None:
@@ -186,7 +182,10 @@ def filter(df: pd.DataFrame, out_fname: str, output_folder: str) -> Tuple[int, p
             f.write(item + "\n")
     results = []
     #start0 = start = time.time()
-    img_embeddings, dff = df_clipfilter(df)
+
+    # img_embeddings, dff = df_clipfilter(df)
+    # we dont need image embeddings anymore
+    dff = df_clipfilter(df)
     dff.to_csv(f"{output_folder}{out_fname}.csv", index=False, sep="|")
 
     #count results for each worker from resulting dff
